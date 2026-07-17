@@ -33,11 +33,14 @@ services:
       - xiaozhi-esp32-server-db
       - xiaozhi-esp32-server-redis
     restart: always
+    dns:
+      - 127.0.0.11
+      - 114.114.114.114
     networks:
       - default
     ports:
       # ws服务端
-      - "8000:8000"
+      - "8001:8000"
       # http服务的端口，用于视觉分析接口
       - "8003:8003"
     security_opt:
@@ -48,7 +51,8 @@ services:
       # 配置文件目录（含 config.yaml）
       - ./data:/opt/xiaozhi-esp32-server/data
       # 模型文件挂接，很重要（ASR 模型，按需提供）
-      - ./models/SenseVoiceSmall/model.pt:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall/model.pt
+      - ./models/SenseVoiceSmall:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall
+      - ./models/snakers4_silero-vad:/opt/xiaozhi-esp32-server/models/snakers4_silero-vad
 
   # manager-api和manager-web模块（含 aipet 注册 + 缓存开关 changelog）
   xiaozhi-esp32-server-web:

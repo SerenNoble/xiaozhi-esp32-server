@@ -45,3 +45,6 @@ class SpeakerTextMessageHandler(TextMessageHandler):
     async def handle(self, conn: "ConnectionHandler", msg_json: Dict[str, Any]) -> None:
         conn.proxy_speaker = msg_json
         conn.proxy_speaker_ready.set()
+        conn.logger.bind(tag=TAG).info(
+            f"已接收外部 speaker 帧: name={msg_json.get('name')}, relationship={msg_json.get('relationship')}"
+        )

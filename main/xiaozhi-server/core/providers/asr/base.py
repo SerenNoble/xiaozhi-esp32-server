@@ -19,6 +19,7 @@ from core.handle.receiveAudioHandle import startToChat
 from core.handle.reportHandle import enqueue_asr_report
 from core.utils.util import remove_punctuation_and_length
 from core.handle.receiveAudioHandle import handleAudioMessage
+from core.handle.textHandler.speakerMessageHandler import resolve_speaker_name
 from typing import Optional, Tuple, List, NamedTuple, TYPE_CHECKING
 
 
@@ -94,9 +95,9 @@ class ASRProviderBase(ABC):
 
             combined_pcm_data = b"".join(pcm_data)
 
-            # 预先准备WAV数据
+            # 预先准备WAV数据（仅本地声纹路径需要；外部 speaker 模式跳过自识别）
             wav_data = None
-            if conn.voiceprint_provider and combined_pcm_data:
+            if conn.voiceprint_provider and combined_pcm_data and not conn.external_vpr_enabled:
                 wav_data = self._pcm_to_wav(combined_pcm_data)
 
             # 定义ASR任务
@@ -104,7 +105,11 @@ class ASRProviderBase(ABC):
                 asr_audio_task, conn.session_id, conn.audio_format
             )
 
-            if conn.voiceprint_provider and wav_data:
+            if conn.external_vpr_enabled:
+                # 外部 speaker 代理（如 lebot）：只跑 ASR，说话人由外部上报
+                asr_result = await asr_task
+                voiceprint_result = None
+            elif conn.voiceprint_provider and wav_data:
                 voiceprint_task = conn.voiceprint_provider.identify_speaker(
                     wav_data, conn.session_id
                 )
@@ -123,7 +128,19 @@ class ASRProviderBase(ABC):
             else:
                 raw_text, _ = asr_result
 
-            if isinstance(voiceprint_result, Exception):
+            # 解析说话人
+            if conn.external_vpr_enabled:
+                # 等待外部 speaker 帧（lebot 在说话中途发送，通常已就绪 → 零等待）
+                try:
+                    await asyncio.wait_for(conn.proxy_speaker_ready.wait(), timeout=0.3)
+                except asyncio.TimeoutError:
+                    pass
+                speaker_name = resolve_speaker_name(conn.proxy_speaker)
+                if speaker_name == "未知说话人":
+                    logger.bind(tag=TAG).info("外部 speaker 未上报或超时，使用未知说话人")
+                else:
+                    logger.bind(tag=TAG).info(f"外部 speaker: {speaker_name}")
+            elif isinstance(voiceprint_result, Exception):
                 logger.bind(tag=TAG).error(f"声纹识别失败: {voiceprint_result}")
                 speaker_name = ""
             else:
