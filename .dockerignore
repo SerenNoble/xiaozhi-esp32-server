@@ -14,3 +14,7 @@ models/
 # sqlite 运行库（aipet / xiaozhi-memory 等运行时生成）
 *.db
 **/*.db
+# 前端/后端构建产物与依赖（镜像内重新安装/编译，避免宿主机残留 node_modules 污染上下文）
+**/node_modules/
+**/dist/
+**/target/

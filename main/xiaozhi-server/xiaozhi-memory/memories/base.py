@@ -15,6 +15,7 @@ class MemoryType(str, Enum):
     PREFERENCE = "preference"
     PROFILE = "profile"
     DANGER = "danger"
+    SESSION_SUMMARY = "session_summary"
 
 
 class MemoryStatus(str, Enum):
@@ -112,3 +113,21 @@ class UserProfile(BaseMemory):
     last_interaction: Optional[datetime] = None
     first_met: Optional[datetime] = None  # 第一次见面时间
     total_interaction_days: int = 0  # 累计互动天数
+
+
+class SessionSummary(BaseMemory):
+    """陪伴卡：会话结束自动生成的结构化摘要，用于新会话主动注入实现无感跨会话记忆延续
+
+    content: 自然语言摘要文本（可直接注入 LLM 上下文）
+    metadata: {
+        "topic_summary": "聊了好朋友小明和画画",
+        "open_loops": ["明天要和小明一起画画"],
+        "emotion": "开心",
+        "key_facts": ["好朋友叫小明", "喜欢画恐龙"],
+        "session_id": "xxx",
+        "message_count": 20,
+        "generation_mode": "llm" | "rules"
+    }
+    """
+    type: MemoryType = MemoryType.SESSION_SUMMARY
+    content: str = Field(default="")  # 自然语言摘要

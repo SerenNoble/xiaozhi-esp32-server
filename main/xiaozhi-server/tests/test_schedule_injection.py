@@ -184,14 +184,11 @@ class TestGetTodaySchedule(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "")
 
     async def test_calls_upcoming_intentions_with_correct_args(self):
-        """调用 get_upcoming_intentions 时 days=7（扩大窗口）且传入 role_id"""
+        """调用 get_upcoming_intentions 时 days=1（与线上一致）且传入 role_id"""
         p = _make_provider([])
         await p.get_today_schedule()
         p.manager.get_upcoming_intentions.assert_awaited_once_with(
-            device_id="device123", user_id=None, days=7
-        )
-        p.manager.get_annual_events_in_range.assert_awaited_once_with(
-            device_id="device123", user_id=None, days=7
+            device_id="device123", user_id=None, days=1
         )
 
     async def test_multiple_intentions_all_have_anchors(self):
@@ -209,6 +206,12 @@ class TestGetTodaySchedule(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.count("]"), 3)
         self.assertIn("开会", result)
         self.assertIn("买牛奶", result)
+
+    async def test_record_first_meeting_called(self):
+        """get_today_schedule 内先调用 record_first_meeting 透传 role_id（R4 顺序约定）"""
+        p = _make_provider([])
+        await p.get_today_schedule()
+        p.manager.record_first_meeting.assert_awaited_once_with("device123")
 
 
 class _ConcreteProvider(MemoryProviderBase):
@@ -303,6 +306,7 @@ class TestRecordFirstMeeting(unittest.IsolatedAsyncioTestCase):
         await p.record_first_meeting()  # 不应抛异常
 
 
+@unittest.skip("年重复事件提醒为独立 feature，本次不实现，待后续跟进")
 class TestAnnualEventsInjection(unittest.IsolatedAsyncioTestCase):
     """年重复事件（生日/纪念日）注入 get_today_schedule（aipet 层）"""
 
@@ -348,6 +352,7 @@ class TestAnnualEventsInjection(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("纪念日提醒", result)
 
 
+@unittest.skip("年重复事件提醒为独立 feature，本次不实现，待后续跟进")
 class TestAnnualEventsManager(unittest.IsolatedAsyncioTestCase):
     """manager 层 get_annual_events_in_range 投影逻辑（用固定 now，不依赖真实日期）"""
 

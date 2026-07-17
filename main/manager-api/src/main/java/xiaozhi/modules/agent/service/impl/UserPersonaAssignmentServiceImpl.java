@@ -63,4 +63,38 @@ public class UserPersonaAssignmentServiceImpl
             this.updateById(e);
         }
     }
+
+    @Override
+    public void upsertColdStart(Long userId, String templateId, BigDecimal score, String reason,
+                                BigDecimal divergenceScore, Integer fallbackFlag, String matchSource) {
+        UserPersonaAssignmentEntity e = getByUserId(userId);
+        if (e == null) {
+            e = new UserPersonaAssignmentEntity();
+            e.setUserId(userId);
+        }
+        e.setMatchedTemplateId(templateId);
+        e.setScore(score);
+        e.setReason(reason);
+        e.setDivergenceScore(divergenceScore);
+        e.setFallbackFlag(fallbackFlag);
+        e.setMatchSource(matchSource);
+        e.setManual(0);
+        e.setMatchedAt(new Date());
+        this.saveOrUpdate(e);
+    }
+
+    @Override
+    public void upsertManual(Long userId, String templateId, String templateName) {
+        UserPersonaAssignmentEntity e = getByUserId(userId);
+        if (e == null) {
+            e = new UserPersonaAssignmentEntity();
+            e.setUserId(userId);
+        }
+        e.setMatchedTemplateId(templateId);
+        e.setManual(1);
+        e.setMatchSource("manual");
+        e.setReason("manual:" + (templateName == null ? "" : templateName));
+        e.setMatchedAt(new Date());
+        this.saveOrUpdate(e);
+    }
 }

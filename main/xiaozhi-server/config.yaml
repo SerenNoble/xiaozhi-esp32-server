@@ -345,6 +345,14 @@ Memory:
     danger_alert:
       api_url: "http://your-api-host/api/v1/internal/messages/event"
       api_key: "your-internal-api-key"
+    # 陪伴卡（会话摘要）：会话结束时自动生成，下次连接开始时主动注入
+    # 不依赖孩子说关键词即可实现跨会话记忆延续
+    session_summary:
+      enabled: true
+      # 注入最近 N 张陪伴卡
+      max_cards: 3
+      # 每张陪伴卡最大字符数（控制 token 预算，约 ~150 字符/张）
+      max_chars_per_card: 150
   mem_local_short:
     # 本地记忆功能，通过selected_module的llm总结，数据保存在本地服务器，不会上传到外部服务器
     type: mem_local_short

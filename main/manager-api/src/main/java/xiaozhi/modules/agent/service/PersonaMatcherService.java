@@ -3,6 +3,7 @@ package xiaozhi.modules.agent.service;
 import java.util.List;
 
 import xiaozhi.modules.agent.vo.PersonaCandidateVO;
+import xiaozhi.modules.device.entity.DeviceEntity;
 
 public interface PersonaMatcherService {
 
@@ -27,4 +28,26 @@ public interface PersonaMatcherService {
      * 遍历用户(来自设备),而非已有 assignment —— 否则空表永远 seed 不了新用户。
      */
     void matchAllNonManualUsers();
+
+    /**
+     * 冷启动匹配:按设备扩展字段(孩子信息)从乐宝模板中 LLM 选型,写入 matched_template_id。
+     * 由 DeviceExtController.saveExt 异步调用;manual=1 用户跳过。
+     */
+    void matchColdStart(String deviceId);
+
+    /**
+     * 在乐宝模板中按孩子信息 JSON 选型,返回模板 id;无法选出返回 null(供冷启动与画像同步复用)。
+     */
+    String selectTemplateId(String childInfoJson);
+
+    /**
+     * 家长手动切换乐宝角色:将指定模板话术 seed 进用户全部设备的绑定 agent,
+     * 并标记 manual=1(自动匹配/画像同步不再覆盖)。
+     */
+    void switchToTemplate(Long userId, String templateId);
+
+    /**
+     * 将指定乐宝模板话术 seed 进某设备的绑定 agent 的 systemPrompt(供冷启动/画像同步/手动切换复用)。
+     */
+    void seedTemplateToDevice(DeviceEntity device, String templateId);
 }

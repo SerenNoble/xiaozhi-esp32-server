@@ -156,6 +156,32 @@ class SQLiteStore(BaseStore):
         """)
 
         self.conn.commit()
+        # 旧库补齐新增列（兼容已部署但 schema 滞后的数据库）
+        self._migrate_columns()
+
+    def _migrate_columns(self):
+        """检测并补齐缺失的新增列，避免已部署旧库因缺列而报错"""
+        try:
+            cursor = self.conn.execute("PRAGMA table_info(memories)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+        except Exception as e:
+            print(f"[DB迁移] 检测列失败: {e}")
+            return
+
+        migrations = {
+            "first_met": "TIMESTAMP",
+            "total_interaction_days": "INTEGER DEFAULT 0",
+        }
+        for col, col_type in migrations.items():
+            if col not in existing_cols:
+                try:
+                    self.conn.execute(
+                        f"ALTER TABLE memories ADD COLUMN {col} {col_type}"
+                    )
+                    self.conn.commit()
+                    print(f"[DB迁移] 补齐缺失列: {col}")
+                except Exception as e:
+                    print(f"[DB迁移] 补列失败 {col}: {e}")
 
     def add(self, memory: BaseMemory) -> str:
         """添加记忆"""
@@ -374,6 +400,7 @@ class SQLiteStore(BaseStore):
                 JOIN memories m ON m.id = fts.id
                 WHERE m.device_id = ? AND m.user_id IS NULL
                     AND m.status = 'active'
+                    AND m.type != 'session_summary'
                     AND memories_fts MATCH ?
                 ORDER BY score
                 LIMIT ?
@@ -477,7 +504,27 @@ class SQLiteStore(BaseStore):
             common_data['total_interaction_days'] = row['total_interaction_days'] or 0
             return UserProfile(**common_data)
 
+        elif memory_type == MemoryType.SESSION_SUMMARY:
+            from memories.base import SessionSummary
+            return SessionSummary(**common_data)
+
         return BaseMemory(**common_data)
+
+    def get_recent_summaries(self, device_id: str, limit: int = 3) -> List[BaseMemory]:
+        """获取设备最近 N 张陪伴卡（按时间倒序，简单 SQL 不走 FTS5）
+
+        Args:
+            device_id: 设备ID
+            limit: 获取数量，默认 3
+
+        Returns:
+            陪伴卡列表（按 created_at DESC 排序）
+        """
+        cursor = self.conn.execute(
+            "SELECT * FROM memories WHERE device_id = ? AND type = ? AND status = ? ORDER BY created_at DESC LIMIT ?",
+            (device_id, MemoryType.SESSION_SUMMARY.value, MemoryStatus.ACTIVE.value, limit)
+        )
+        return [self._row_to_memory(row) for row in cursor.fetchall()]
 
     def close(self):
         """关闭数据库连接"""

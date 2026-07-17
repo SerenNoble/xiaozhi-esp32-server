@@ -18,4 +18,11 @@ public interface UserPersonaAssignmentService extends IService<UserPersonaAssign
 
     /** 恢复自动匹配(manual=0) */
     void resetAuto(Long userId);
+
+    /** 冷启动/画像同步写入模板匹配(manual=0,走 matched_template_id 路径) */
+    void upsertColdStart(Long userId, String templateId, BigDecimal score, String reason,
+                         BigDecimal divergenceScore, Integer fallbackFlag, String matchSource);
+
+    /** 家长手动切换乐宝模板(manual=1,标 matched_template_id + match_source=manual,自动任务不再覆盖) */
+    void upsertManual(Long userId, String templateId, String templateName);
 }

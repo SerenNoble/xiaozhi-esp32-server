@@ -29,3 +29,21 @@ class LLMClient(ABC):
             [{"content": "...", "type": "FACT|INTENTION|PREFERENCE", ...}]
         """
         pass
+
+    @abstractmethod
+    async def generate_summary(
+        self,
+        conversation: str,
+        context: Dict[str, Any]
+    ) -> str:
+        """
+        从对话中生成会话摘要（陪伴卡）
+
+        Args:
+            conversation: 对话文本
+            context: 上下文信息
+
+        Returns:
+            自然语言摘要文本
+        """
+        pass

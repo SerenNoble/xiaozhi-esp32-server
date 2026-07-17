@@ -141,6 +141,41 @@
 
                     <el-form-item>
                       <template #label>
+                        <el-tooltip content="由设备扩展字段/外部画像自动匹配出的乐宝角色（设备级，只读展示）" placement="top" effect="light" popper-class="custom-tooltip">
+                          <span>当前乐宝角色：</span>
+                        </el-tooltip>
+                      </template>
+                      <div class="persona-panel">
+                        <div class="persona-source">
+                          <el-tag :type="currentPersona.manual === 1 ? 'warning' : 'success'" size="mini" effect="plain">
+                            {{ currentPersona.manual === 1 ? '家长手动' : '自动匹配' }}
+                          </el-tag>
+                          <span v-if="currentPersona.matchSource" class="persona-source-text">来源：{{ sourceText(currentPersona.matchSource) }}</span>
+                          <span v-if="currentPersona.reason" class="persona-source-text">（{{ currentPersona.reason }}）</span>
+                          <el-tag v-if="currentPersona.fallbackFlag === 1" type="danger" size="mini" effect="plain" style="margin-left:6px;">已兜底</el-tag>
+                          <el-button v-if="currentPersona.manual === 1" size="mini" type="warning" plain style="margin-left:6px;" @click="resetAutoMatch">恢复自动匹配</el-button>
+                        </div>
+                        <div class="persona-templates">
+                          <div
+                            v-for="t in currentPersona.templates"
+                            :key="t.id"
+                            class="persona-template-card"
+                            :class="{ 'is-matched': t.id === currentPersona.templateId }"
+                            @click="switchTemplate(t.id)"
+                          >
+                            <div class="persona-template-name">{{ t.name }}</div>
+                            <div class="persona-template-meta">{{ t.metaSummary }}</div>
+                            <div v-if="t.id === currentPersona.templateId" class="persona-check">✓</div>
+                          </div>
+                        </div>
+                        <div v-if="!currentPersona.templateId" class="persona-empty">
+                          尚未匹配乐宝角色，请在设备卡片「配置乐宝」填写孩子信息后自动匹配。
+                        </div>
+                      </div>
+                    </el-form-item>
+
+                    <el-form-item>
+                      <template #label>
                         <el-tooltip :content="$t('roleConfig.tooltip.memoryHis')" placement="top" effect="light" popper-class="custom-tooltip">
                           <span>{{ $t('roleConfig.memoryHis') }}：</span>
                         </el-tooltip>
@@ -478,6 +513,7 @@
 <script>
 import Api from "@/apis/api";
 import { getServiceUrl } from "@/apis/api";
+import Persona from "@/apis/module/persona";
 import RequestService from "@/apis/httpRequest";
 import FunctionDialog from "@/components/FunctionDialog.vue";
 import ContextProviderDialog from "@/components/ContextProviderDialog.vue";
@@ -500,6 +536,15 @@ export default {
         pitch: 0
       },
       tempSummaryMemory: "",
+      currentPersona: {
+        templateId: null,
+        templateName: '',
+        matchSource: '',
+        manual: 0,
+        reason: '',
+        fallbackFlag: 0,
+        templates: []
+      },
       form: {
         agentCode: "",
         agentName: "",
@@ -678,6 +723,64 @@ export default {
           this.templates = data.data;
         } else {
           this.$message.error(data.msg || i18n.t("roleConfig.fetchTemplatesFailed"));
+        }
+      });
+    },
+    fetchCurrentPersona() {
+      Persona.current(({ data }) => {
+        if (data && data.code === 0 && data.data) {
+          const d = data.data;
+          this.currentPersona = {
+            templateId: d.templateId || null,
+            templateName: d.templateName || '',
+            matchSource: d.matchSource || '',
+            manual: d.manual || 0,
+            reason: d.reason || '',
+            fallbackFlag: d.fallbackFlag || 0,
+            templates: d.templates || []
+          };
+        }
+      });
+    },
+    sourceText(s) {
+      const map = {
+        cold_start: '冷启动',
+        cold_start_default: '冷启动兜底',
+        profile_sync: '画像同步',
+        weekly: '周匹配',
+        manual: '手动'
+      };
+      return map[s] || s;
+    },
+    // 家长手动切换乐宝角色(点击模板卡片)
+    switchTemplate(templateId) {
+      const t = (this.currentPersona.templates || []).find(x => x.id === templateId);
+      const name = t ? t.name : '';
+      this.$confirm(`确定将乐宝角色切换为「${name}」吗？切换后自动匹配将暂停，可随时「恢复自动匹配」。`, '手动切换乐宝角色', {
+        confirmButtonText: '确定切换',
+        cancelButtonText: '取消',
+        type: 'warning'
+      }).then(() => {
+        Persona.switchPersona(templateId, ({ data }) => {
+          if (data && data.code === 0) {
+            this.$message.success('已切换乐宝角色');
+            this.fetchCurrentPersona();
+            // 同步文本框为切换后模板话术
+            this.fetchAgentConfig(this.$route.query.agentId);
+          } else {
+            this.$message.error((data && data.msg) || '切换失败');
+          }
+        });
+      }).catch(() => {});
+    },
+    // 恢复自动匹配(manual=0,自动任务将重新评估)
+    resetAutoMatch() {
+      Persona.resetAuto(({ data }) => {
+        if (data && data.code === 0) {
+          this.$message.success('已恢复自动匹配');
+          this.fetchCurrentPersona();
+        } else {
+          this.$message.error((data && data.msg) || '操作失败');
         }
       });
     },
@@ -1410,6 +1513,7 @@ export default {
     }
     this.fetchModelOptions();
     this.fetchTemplates();
+    this.fetchCurrentPersona();
     // 加载功能状态，确保featureManager已初始化
     await this.loadFeatureStatus();
   },
@@ -1639,6 +1743,83 @@ export default {
 
 .template-item:hover {
   background-color: #d0d8ff;
+}
+
+.persona-panel {
+  width: 100%;
+  border: 1px solid #e8f0ff;
+  border-radius: 12px;
+  padding: 14px 16px;
+  background: #f7faff;
+}
+
+.persona-source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.persona-source-text {
+  font-size: 12px;
+  color: #909399;
+}
+
+.persona-templates {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.persona-template-card {
+  position: relative;
+  width: 150px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid #e4e9f5;
+  transition: all 0.3s ease;
+  cursor: pointer;
+}
+
+.persona-template-card.is-matched {
+  border: 2px solid #2F7CF6;
+  box-shadow: 0 4px 16px rgba(47, 124, 246, 0.18);
+  background: #eef4ff;
+}
+
+.persona-template-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 6px;
+}
+
+.persona-template-meta {
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.5;
+}
+
+.persona-check {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #2F7CF6;
+  color: #fff;
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.persona-empty {
+  font-size: 13px;
+  color: #909399;
+  line-height: 1.6;
 }
 
 .model-select-wrapper {

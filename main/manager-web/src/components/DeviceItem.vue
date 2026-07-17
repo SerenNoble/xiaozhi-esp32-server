@@ -15,6 +15,13 @@
         </el-tooltip>
       </div>
     </div>
+    <div v-if="persona.templateName" class="persona-badge">
+      <span class="persona-label">乐宝角色</span>
+      <span class="persona-name">{{ persona.templateName }}</span>
+      <el-tag :type="persona.manual === 1 ? 'warning' : 'success'" size="mini" effect="plain">
+        {{ persona.manual === 1 ? '手动' : '自动' }}
+      </el-tag>
+    </div>
     <div class="device-name">
       {{ $t('home.languageModel') }}：{{ device.llmModelName }}
     </div>
@@ -38,6 +45,7 @@
         </el-tooltip>
         <span v-else>{{ $t('home.chatHistory') }}</span>
       </div>
+      <div class="settings-btn" @click="openChildDialog">配置乐宝</div>
     </div>
     <div class="version-info">
       <div>{{ $t('home.lastConversation') }}：{{ formattedLastConnectedTime }}</div>
@@ -47,12 +55,28 @@
         </div>
       </el-tooltip>
     </div>
+    <el-dialog title="配置乐宝角色" :visible.sync="showChildDialog" width="440px" @open="loadChildExt">
+      <el-form :model="childForm" label-width="86px">
+        <el-form-item label="孩子年龄段"><el-input v-model="childForm.childAgeRange" placeholder="如 4-7 岁" /></el-form-item>
+        <el-form-item label="孩子性格"><el-input v-model="childForm.childPersonality" placeholder="如 活泼好动、喜欢挑战" /></el-form-item>
+        <el-form-item label="家长期望"><el-input v-model="childForm.parentGoals" placeholder="如 培养勇气与专注" /></el-form-item>
+        <el-form-item label="家长关注"><el-input v-model="childForm.parentConcerns" placeholder="如 情绪管理" /></el-form-item>
+        <el-form-item label="内容偏好"><el-input v-model="childForm.contentPreference" placeholder="如 科普、故事" /></el-form-item>
+      </el-form>
+      <div v-if="matchResult" class="match-result">已为你匹配：<b>{{ matchResult }}</b></div>
+      <span slot="footer" class="dialog-footer">
+        <el-button @click="showChildDialog = false">取消</el-button>
+        <el-button type="primary" :loading="matching" @click="saveChildInfo">保存并匹配</el-button>
+      </span>
+    </el-dialog>
   </div>
 </template>
 
 <script>
 import i18n from '@/i18n';
 import Api from '@/apis/api';
+import Persona from '@/apis/module/persona';
+import Device from '@/apis/module/device';
 
 export default {
   name: 'DeviceItem',
@@ -68,7 +92,21 @@ export default {
     }
   },
   data() {
-    return { switchValue: false }
+    return {
+      switchValue: false,
+      persona: { templateName: '', matchSource: '', manual: 0, fallbackFlag: 0, reason: '' },
+      showChildDialog: false,
+      matching: false,
+      matchResult: '',
+      realDeviceId: '',
+      childForm: {
+        childAgeRange: '',
+        childPersonality: '',
+        parentGoals: '',
+        parentConcerns: '',
+        contentPreference: ''
+      }
+    }
   },
   computed: {
     formattedLastConnectedTime() {
@@ -113,7 +151,84 @@ export default {
         return
       }
       this.$emit('chat-history', { agentId: this.device.agentId, agentName: this.device.agentName })
+    },
+    fetchPersona() {
+      Persona.current(({ data }) => {
+        if (data && data.code === 0 && data.data) {
+          const d = data.data;
+          this.persona = {
+            templateName: d.templateName || '',
+            matchSource: d.matchSource || '',
+            manual: d.manual || 0,
+            fallbackFlag: d.fallbackFlag || 0,
+            reason: d.reason || ''
+          };
+        }
+      });
+    },
+    resolveDeviceId() {
+      // home 列表项 id 实为 agentId,需反查真实设备 id 才能操作 /device/{id}/ext
+      Api.device.getAgentBindDevices(this.device.agentId, ({ data }) => {
+        if (data && data.code === 0 && data.data && data.data.length) {
+          this.realDeviceId = data.data[0].id;
+        } else {
+          this.realDeviceId = '';
+        }
+      });
+    },
+    openChildDialog() {
+      if (!this.realDeviceId) {
+        this.$message.warning('该智能体未绑定设备，无法配置乐宝角色');
+        return;
+      }
+      this.matchResult = '';
+      this.showChildDialog = true;
+    },
+    loadChildExt() {
+      Device.getExt(this.realDeviceId, ({ data }) => {
+        const obj = data && data.code === 0 && data.data ? data.data : {};
+        this.childForm = {
+          childAgeRange: obj.childAgeRange || '',
+          childPersonality: obj.childPersonality || '',
+          parentGoals: obj.parentGoals || '',
+          parentConcerns: obj.parentConcerns || '',
+          contentPreference: obj.contentPreference || ''
+        };
+      });
+    },
+    saveChildInfo() {
+      if (!this.realDeviceId) {
+        this.$message.warning('该智能体未绑定设备，无法配置乐宝角色');
+        return;
+      }
+      this.matching = true;
+      const extObj = {};
+      Object.keys(this.childForm).forEach(k => { if (this.childForm[k]) extObj[k] = this.childForm[k]; });
+      Device.saveExt(this.realDeviceId, extObj, () => {
+        this.$message.success('已保存，正在为你匹配乐宝角色');
+        setTimeout(() => this.refreshPersonaAfterMatch(), 2500);
+      });
+    },
+    refreshPersonaAfterMatch() {
+      Persona.current(({ data }) => {
+        if (data && data.code === 0 && data.data) {
+          const d = data.data;
+          this.persona = {
+            templateName: d.templateName || '',
+            matchSource: d.matchSource || '',
+            manual: d.manual || 0,
+            fallbackFlag: d.fallbackFlag || 0,
+            reason: d.reason || ''
+          };
+          this.matchResult = d.templateName ? d.templateName : '匹配中，请稍后刷新';
+        }
+        this.matching = false;
+      });
     }
+  },
+  mounted() {
+    this.resolveDeviceId();
+    this.fetchPersona();
   },
 }
 </script>
@@ -173,6 +288,31 @@ export default {
     text-wrap: nowrap;
     text-align: right;
   }
+}
+
+.persona-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 2px;
+  &-label {
+    font-size: 12px;
+    color: #909399;
+  }
+  &-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: #2F7CF6;
+  }
+}
+
+.match-result {
+  margin-top: 12px;
+  padding: 8px 12px;
+  background: #e6f0ff;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #303133;
 }
 
 .more-tag {

@@ -97,3 +97,39 @@ class OpenAIClient(LLMClient):
         except Exception as e:
             logger.error(f"Failed to extract facts: {e}")
             raise
+
+    async def generate_summary(
+        self,
+        conversation: str,
+        context: Dict[str, Any]
+    ) -> str:
+        """从对话中生成会话摘要（陪伴卡），为 3-7 岁儿童对话场景设计"""
+        prompt = (
+            f"当前日期：{context.get('current_date', '未知')}\n"
+            "你是一个儿童语音伴侣的会话摘要员。请根据以下对话，生成一段简短摘要（不超过120字，一段话），"
+            "用儿童的视角和语气，必须包含：\n"
+            "1. 孩子今天聊了哪些话题（1-2句话）\n"
+            "2. 有什么未完成的事（如：讲到一半的故事、约定的游戏、计划要做的事，如果有的话）\n"
+            "3. 孩子的情绪状态（开心/兴奋/委屈/难过/平静）\n"
+            "行为指引：若孩子仅简单打招呼（如只说\"你好\"），不要写开场白式内容，直接注明\"无实质内容\"；"
+            "若之前有未完成的约定/游戏/故事，要在摘要里点明，方便下次主动提起、自然延续话题。\n"
+            "请直接返回摘要文本，不要加任何前缀或解释。语气温暖亲切，像朋友的口吻。\n\n"
+            f"对话内容：\n{conversation}"
+        )
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是一个温暖细心的儿童记录员，善于捕捉孩子对话中的关键信息。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.5,
+                max_tokens=200,
+            )
+            summary = response.choices[0].message.content.strip()
+            logger.info(f"Generated session summary: {summary[:80]}...")
+            return summary
+        except Exception as e:
+            logger.error(f"Failed to generate session summary: {e}")
+            raise

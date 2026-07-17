@@ -106,6 +106,11 @@ public class AgentTemplateEntity implements Serializable {
     private String systemPrompt;
 
     /**
+     * 结构化匹配元数据 JSON {ageRange,personalityTags,guidanceGoals,emotionalSupportLevel,languageComplexity}
+     */
+    private String matchMetaJson;
+
+    /**
      * 总结记忆
      */
     private String summaryMemory;

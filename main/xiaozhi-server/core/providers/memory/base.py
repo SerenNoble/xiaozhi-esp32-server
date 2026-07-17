@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 from config.logger import setup_logging
 
 TAG = __name__
@@ -30,3 +31,11 @@ class MemoryProviderBase(ABC):
     async def get_today_schedule(self) -> str:
         """获取当天日程，注入半稳定系统提示词（默认空，子类按需实现）"""
         return ""
+
+    async def record_first_meeting(self) -> int:
+        """记录首次见面（默认无操作，子类按需实现）"""
+        return 0
+
+    async def get_relationship_milestone(self) -> Optional[str]:
+        """关系里程碑文案（默认无，子类按需实现）"""
+        return None

@@ -39,6 +39,19 @@ public class UserPersonaAssignmentEntity {
     @Schema(description = "匹配理由")
     private String reason;
 
+    @Schema(description = "匹配的乐宝模板ID(模板路径生效,优先于 agentId)")
+    private String matchedTemplateId;
+
+    @Schema(description = "画像与当前模板的偏差分(0~1)")
+    private BigDecimal divergenceScore;
+
+    @Schema(description = "1=角色不足已兜底(通知管理员)")
+    @TableField(value = "`fallback_flag`")
+    private Integer fallbackFlag;
+
+    @Schema(description = "匹配来源 cold_start/cold_start_default/weekly/manual")
+    private String matchSource;
+
     @Schema(description = "最近匹配时间")
     private Date matchedAt;
 

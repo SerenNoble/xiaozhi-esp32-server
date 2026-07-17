@@ -92,7 +92,8 @@ class Dialogue:
         return result
 
     def get_llm_dialogue_with_memory(
-            self, memory_str: str = None, voiceprint_config: dict = None, schedule_str: str = None
+            self, memory_str: str = None, voiceprint_config: dict = None, schedule_str: str = None,
+            companion_str: str = None
     ) -> List[Dict[str, str]]:
         # 构建对话
         dialogue = []
@@ -178,6 +179,15 @@ class Dialogue:
             # 避免 <memory> 块被上面的正则清理逻辑误删
             if schedule_str:
                 semi_stable_part += f"\n<schedule>\n以下是用户近期的安排：\n{schedule_str}\n</schedule>"
+            # 陪伴卡（上轮会话摘要）注入半稳定 system 段，紧邻日程；
+            # 用独立 <companion> 标签 + 固定行为指令，强化"勿重复开场白、直接延续上轮话题"
+            if companion_str:
+                semi_stable_part += (
+                    f"\n<companion>\n{companion_str}\n"
+                    "你已认识这个孩子，以上是上一轮对话的陪伴卡。"
+                    "不要重复开场白或自我介绍，直接基于上方上轮内容自然延续互动；"
+                    "若上次有未完成的约定/游戏/故事，主动提起。\n</companion>"
+                )
             if semi_stable_part:
                 dialogue.append({"role": "system", "content": semi_stable_part})
 

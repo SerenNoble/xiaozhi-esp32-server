@@ -4,6 +4,7 @@ import os
 import asyncio
 import aiohttp
 from datetime import datetime
+from typing import Optional
 
 from ..base import MemoryProviderBase, logger
 
@@ -218,7 +219,9 @@ class MemoryProvider(MemoryProviderBase):
                 "retrieval_mode": config.get("retrieval_mode", "fts5"),
                 "sqlite": {"path": self.db_path},
                 "llm": config.get("llm", {}),
-                "extraction": config.get("extraction", {"enabled": False})
+                "extraction": config.get("extraction", {"enabled": False}),
+                # 透传陪伴卡配置（含 llm_enabled 开关），供 MemoryManager 解耦摘要开关
+                "session_summary": config.get("session_summary", {}),
             }
 
             # MemoryManager.__init__ 内部有 "from core.retriever.fts import FTS5Retriever"
@@ -272,6 +275,56 @@ class MemoryProvider(MemoryProviderBase):
         except Exception as e:
             logger.bind(tag=TAG).error(f"初始化 aipet 记忆服务失败: {e}")
 
+    def init_memory(self, role_id, llm, **kwargs):
+        """覆写基类：复用主 LLM 客户端为陪伴卡生成 LLM 摘要
+
+        主 LLM（self.llm，运行时由智控台注入真实 api_key）是 openai 兼容的
+        LLMProvider 实例，暴露 api_key / model_name / base_url 属性。从中提取参数
+        构造 xiaozhi_memory 的 OpenAIClient，赋给 MemoryManager.llm_client，
+        使陪伴卡（会话摘要）走 LLM 生成，而非规则模式原始拼接。
+        不依赖 Memory.aipet 中是否配置 llm（本地 config 该字段为占位符）。
+        """
+        # 先调用基类设置 self.role_id / self.llm
+        super().init_memory(role_id, llm, **kwargs)
+
+        if not self.manager:
+            return
+
+        try:
+            # 从主 LLM 实例提取 openai 兼容连接参数（真实密钥在运行实例上）
+            api_key = getattr(llm, "api_key", None)
+            model = getattr(llm, "model_name", None) or getattr(llm, "model", None)
+            base_url = getattr(llm, "base_url", None) or getattr(llm, "url", None)
+
+            if not (api_key and model):
+                logger.bind(tag=TAG).warning(
+                    "[陪伴卡] 主 LLM 缺少 api_key/model，无法启用 LLM 摘要，回退规则模式"
+                )
+                return
+
+            # 复用模块加载阶段已就绪的 OpenAIClient 类
+            import sys
+            openai_client_mod = sys.modules.get("xiaozhi_memory.llm.openai_client")
+            if openai_client_mod is None or not hasattr(openai_client_mod, "OpenAIClient"):
+                logger.bind(tag=TAG).warning("[陪伴卡] OpenAIClient 未加载，回退规则模式")
+                return
+
+            client = openai_client_mod.OpenAIClient(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+            )
+            self.manager.llm_client = client
+            # 启用陪伴卡 LLM 摘要（独立于记忆抽取 extraction 开关）
+            self.manager.session_summary_enabled = True
+            logger.bind(tag=TAG).info(
+                f"[陪伴卡] 已复用主 LLM 构造摘要客户端: model={model}"
+            )
+        except Exception as e:
+            logger.bind(tag=TAG).error(
+                f"[陪伴卡] 构造 LLM 摘要客户端失败，回退规则模式: {e}"
+            )
+
     async def save_memory(self, msgs, session_id=None):
         """保存记忆并检测危险行为"""
         if not self.manager or not self.role_id:
@@ -304,6 +357,19 @@ class MemoryProvider(MemoryProviderBase):
             # role_id 作为 device_id，user_id 可选
             result = await self.manager.add_memory(messages, device_id=self.role_id, user_id=None)
             logger.bind(tag=TAG).debug(f"Save memory result: {result}")
+
+            # 生成陪伴卡（会话摘要），可通过 config.session_summary.enabled 控制
+            session_config = self.config.get("session_summary", {})
+            if session_config.get("enabled", True):
+                try:
+                    await self.manager.generate_session_summary(
+                        messages=messages,
+                        device_id=self.role_id,
+                        user_id=None,
+                        session_id=session_id
+                    )
+                except Exception as e:
+                    logger.bind(tag=TAG).error(f"生成陪伴卡失败（不影响原有流程）: {e}")
 
             # 处理危险行为检测结果
             dangers = result.get("dangers", [])
@@ -442,6 +508,48 @@ class MemoryProvider(MemoryProviderBase):
             logger.bind(tag=TAG).error(f"查询记忆失败: {str(e)}")
             return ""
 
+    async def get_recent_session_summaries(self, limit: int = 3) -> str:
+        """获取最近 N 张陪伴卡，用于新会话主动注入（不走 FTS5，直接 SQL 按时间排序）
+
+        Args:
+            limit: 获取数量，默认 3
+
+        Returns:
+            格式化的陪伴卡文本，可直接注入 LLM 上下文；无陪伴卡或功能禁用时返回空字符串
+        """
+        if not self.manager or not self.role_id:
+            return ""
+
+        # 检查陪伴卡功能是否启用
+        session_config = self.config.get("session_summary", {})
+        if not session_config.get("enabled", True):
+            return ""
+
+        try:
+            max_cards = session_config.get("max_cards", limit)
+            max_chars = session_config.get("max_chars_per_card", 150)
+
+            summaries = self.manager.store.get_recent_summaries(
+                device_id=self.role_id,
+                limit=max_cards
+            )
+            if not summaries:
+                return ""
+
+            lines = []
+            for s in summaries:
+                # 每条陪伴卡截断以控制 token 预算
+                content = s.content[:max_chars]
+                lines.append(content)
+            result = "\n".join(lines)
+            logger.bind(tag=TAG).info(
+                f"[陪伴卡] 注入 {len(summaries)} 张，总长度 {len(result)} 字符"
+            )
+            return result
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"获取陪伴卡失败: {e}")
+            return ""
+
     @staticmethod
     def _format_when(planned_time, time_description, today):
         """格式化日程时间锚点。优先用绝对日期+相对描述，降低模型对多条日程的时间混淆"""
@@ -455,33 +563,70 @@ class MemoryProvider(MemoryProviderBase):
             return f"[{time_description}]"
         return "[近期]"
 
+    async def record_first_meeting(self) -> int:
+        """透传首次见面记录到 MemoryManager（幂等落库 first_met）"""
+        if not self.manager or not getattr(self, "role_id", None):
+            return 0
+        try:
+            return await self.manager.record_first_meeting(self.role_id)
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"记录首次见面失败: {e}")
+            return 0
+
+    async def get_relationship_milestone(self) -> Optional[str]:
+        """透传关系里程碑文案到 MemoryManager"""
+        if not self.manager or not getattr(self, "role_id", None):
+            return None
+        try:
+            return await self.manager.get_relationship_milestone(self.role_id)
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"查询关系里程碑失败: {e}")
+            return None
+
     async def get_today_schedule(self) -> str:
-        """获取当天及近期日程，以及高危行为警告，注入半稳定系统提示词"""
+        """获取当天日程、关系里程碑、高危行为警告，注入半稳定系统提示词"""
         parts = []
 
-        # 获取日程
-        if self.manager and getattr(self, "role_id", None):
-            try:
-                intentions = await self.manager.get_upcoming_intentions(
-                    device_id=self.role_id, user_id=None, days=1
-                )
-                if intentions:
-                    today = datetime.now().date()
-                    lines = [
-                        f"- {self._format_when(it.planned_time, it.time_description, today)} {it.content}"
-                        for it in intentions
-                    ]
-                    parts.append("今日计划：\n" + "\n".join(lines))
-            except Exception as e:
-                logger.bind(tag=TAG).error(f"查询日程失败: {str(e)}")
+        # 前置守卫：无 manager 或 role_id 时安全返回空
+        if not self.manager or not getattr(self, "role_id", None):
+            return ""
 
-            # 获取高危行为警告
-            try:
-                danger_str = await self.query_danger_warnings()
-                if danger_str:
-                    parts.append("安全提醒（需关注）：\n" + danger_str)
-            except Exception as e:
-                logger.bind(tag=TAG).error(f"查询危险记录失败: {str(e)}")
+        # 先幂等记录首次见面（确保同请求内 first_met 已落库，供里程碑读取）
+        try:
+            await self.record_first_meeting()
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"记录首次见面失败: {e}")
+
+        # 关系里程碑（首次见面 / 认识第 N 天）→ 放在最前，强化开场感知
+        try:
+            milestone = await self.get_relationship_milestone()
+            if milestone:
+                parts.append("关系提醒：\n" + milestone)
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"查询关系里程碑失败: {e}")
+
+        # 获取日程
+        try:
+            intentions = await self.manager.get_upcoming_intentions(
+                device_id=self.role_id, user_id=None, days=1
+            )
+            if intentions:
+                today = datetime.now().date()
+                lines = [
+                    f"- {self._format_when(it.planned_time, it.time_description, today)} {it.content}"
+                    for it in intentions
+                ]
+                parts.append("今日计划：\n" + "\n".join(lines))
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"查询日程失败: {str(e)}")
+
+        # 获取高危行为警告
+        try:
+            danger_str = await self.query_danger_warnings()
+            if danger_str:
+                parts.append("安全提醒（需关注）：\n" + danger_str)
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"查询危险记录失败: {str(e)}")
 
         if not parts:
             logger.bind(tag=TAG).debug(f"[日程/安全] 无内容注入")

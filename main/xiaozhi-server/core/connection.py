@@ -138,6 +138,10 @@ class ConnectionHandler:
 
         # 为每个连接单独管理声纹识别
         self.voiceprint_provider = None
+        # lebot 外部 speaker 注入支持
+        self.external_vpr_enabled = False
+        self.proxy_speaker = None
+        self.proxy_speaker_ready = asyncio.Event()
 
         # vad相关变量
         self.client_audio_buffer = bytearray()
@@ -208,6 +212,8 @@ class ConnectionHandler:
             )
 
             self.device_id = self.headers.get("device-id", None)
+            # lebot 外部 speaker 注入：通过 header 标记本连接信任外部声纹结果
+            self.external_vpr_enabled = self.headers.get("x-external-speaker") == "1"
 
             # 认证通过,继续处理
             self.websocket = ws
@@ -283,7 +289,7 @@ class ConnectionHandler:
 
                 threading.Thread(target=generate_title_task, daemon=True).start()
 
-            # 守护线程2：走老流程记忆保存（仅记忆，不含标题）
+            # 记忆保存线程：非 daemon + 超时等待，确保陪伴卡等关键记忆不丢失
             if self.memory:
                 # 使用线程池异步保存记忆
                 def save_memory_task():
@@ -304,12 +310,23 @@ class ConnectionHandler:
                         except Exception:
                             pass
 
-                # 启动线程保存记忆，不等待完成
-                threading.Thread(target=save_memory_task, daemon=True).start()
+                # 非 daemon 线程：主进程退出前必须等待完成
+                memory_thread = threading.Thread(target=save_memory_task, daemon=False)
+                memory_thread.start()
+            else:
+                memory_thread = None
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"保存记忆失败: {e}")
         finally:
-            # 立即关闭连接，不等待记忆保存完成
+            # 等待记忆保存完成（最多 5 秒），确保陪伴卡写入可靠性
+            if memory_thread is not None and memory_thread.is_alive():
+                try:
+                    memory_thread.join(timeout=5)
+                    if memory_thread.is_alive():
+                        self.logger.bind(tag=TAG).warning("记忆保存超时（5秒），强制关闭连接")
+                except Exception:
+                    pass
+            # 关闭连接
             try:
                 await self.close(ws)
             except Exception as close_error:
@@ -736,7 +753,15 @@ class ConnectionHandler:
             ]
         if private_config.get("Memory", None) is not None:
             init_memory = True
-            self.config["Memory"] = private_config["Memory"]
+            # 保留本地 db_path，防止 API 分配临时数据库导致跨会话记忆丢失
+            api_memory = private_config["Memory"]
+            local_memory = self.config.get("Memory", {})
+            for key, api_val in api_memory.items():
+                if isinstance(api_val, dict) and isinstance(local_memory.get(key), dict):
+                    local_db = local_memory[key].get("db_path")
+                    if local_db:
+                        api_val["db_path"] = local_db
+            self.config["Memory"] = api_memory
             self.config["selected_module"]["Memory"] = private_config[
                 "selected_module"
             ]["Memory"]
@@ -964,13 +989,23 @@ class ConnectionHandler:
             # 使用带记忆的对话
             memory_str = None
             schedule_str = None
+            companion_cards = None
             if self.memory is not None:
-                # 仅当query非空（代表用户询问）时查询记忆（注入实时 user 部分）
+                # 无条件拉取最近陪伴卡（主动注入，不依赖孩子说关键词）
+                # 注意：陪伴卡走独立的 system 半稳定段（companion_str），
+                # 不再与 FTS5 事实记忆合并进 user 段的 memory_str
+                future = asyncio.run_coroutine_threadsafe(
+                    self.memory.get_recent_session_summaries(limit=3), self.loop
+                )
+                companion_cards = future.result()
+                # 仅当query非空（代表用户询问）时查询记忆（FTS5 被动召回，走 user 段）
+                fts_memory = ""
                 if query:
                     future = asyncio.run_coroutine_threadsafe(
                         self.memory.query_memory(query), self.loop
                     )
-                    memory_str = future.result()
+                    fts_memory = future.result() or ""
+                memory_str = fts_memory if fts_memory else None
                 # 当天日程每轮注入半稳定系统提示词（当天固定，可缓存）
                 future = asyncio.run_coroutine_threadsafe(
                     self.memory.get_today_schedule(), self.loop
@@ -982,7 +1017,8 @@ class ConnectionHandler:
                 llm_responses = self.llm.response_with_functions(
                     self.session_id,
                     self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), schedule_str
+                        memory_str, self.config.get("voiceprint", {}), schedule_str,
+                        companion_cards if companion_cards else None
                     ),
                     functions=functions,
                 )
@@ -990,7 +1026,8 @@ class ConnectionHandler:
                 llm_responses = self.llm.response(
                     self.session_id,
                     self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), schedule_str
+                        memory_str, self.config.get("voiceprint", {}), schedule_str,
+                        companion_cards if companion_cards else None
                     ),
                 )
         except Exception as e:
@@ -1510,6 +1547,10 @@ class ConnectionHandler:
 
         # Clear ASR buffers
         self.asr_audio.clear()
+
+        # 重置外部 speaker 注入状态（每轮独立）
+        self.proxy_speaker = None
+        self.proxy_speaker_ready.clear()
 
         self.logger.bind(tag=TAG).debug("All audio states reset.")
 

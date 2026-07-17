@@ -105,4 +105,35 @@ export default {
                 });
             }).send();
     },
+    // 取设备扩展字段(孩子信息+家长期望)
+    getExt(deviceId, callback) {
+        RequestService.sendRequest()
+            .url(`${getServiceUrl()}/device/${deviceId}/ext`)
+            .method('GET')
+            .success((res) => {
+                RequestService.clearRequestTime();
+                callback(res);
+            })
+            .networkFail(() => {
+                RequestService.reAjaxFun(() => {
+                    this.getExt(deviceId, callback);
+                });
+            }).send();
+    },
+    // 保存设备扩展字段(整体覆盖,触发冷启动匹配)
+    saveExt(deviceId, extObj, callback) {
+        RequestService.sendRequest()
+            .url(`${getServiceUrl()}/device/${deviceId}/ext`)
+            .method('PUT')
+            .data(extObj)
+            .success((res) => {
+                RequestService.clearRequestTime();
+                callback(res);
+            })
+            .networkFail(() => {
+                RequestService.reAjaxFun(() => {
+                    this.saveExt(deviceId, extObj, callback);
+                });
+            }).send();
+    },
 }

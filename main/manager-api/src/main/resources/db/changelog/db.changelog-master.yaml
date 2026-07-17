@@ -676,3 +676,10 @@ databaseChangeLog:
         - sqlFile:
             encoding: utf8
             path: classpath:db/changelog/202607011000.sql
+  - changeSet:
+      id: 202607151000
+      author: aipet
+      changes:
+        - sqlFile:
+            encoding: utf8
+            path: classpath:db/changelog/202607151000.sql

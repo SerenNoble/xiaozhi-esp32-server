@@ -47,6 +47,12 @@ class MemoryManager:
             "observation_date_delta": 0
         })
 
+        # 陪伴卡（会话摘要）LLM 开关：默认跟随 llm_client 是否存在；
+        # 由 aipet provider 注入主 LLM 客户端后显式置 True，独立于 extraction 抽取开关
+        self.session_summary_enabled = config.get("session_summary", {}).get(
+            "llm_enabled", self.llm_client is not None
+        )
+
         # 会话级别的最近提取记忆（用于去重）
         self._session_extracted: List[str] = []
 
@@ -236,6 +242,11 @@ class MemoryManager:
         for msg in messages:
             content = msg.get("content", "")
             if not content:
+                continue
+
+            # 跳过 AI（assistant）自己的回复：其开场白/寒暄若存成可召回的 fact，
+            # 下次对话会被 FTS5 召回，导致 AI 复述自身开场白（重复开场白根因）
+            if msg.get("role") == "assistant":
                 continue
 
             # 解析时间信息
@@ -628,20 +639,48 @@ class MemoryManager:
             }
             await self.create_or_update_profile(device_id, profile)
             return 1
-        else:
-            # 更新互动天数
-            days = 1
-            if existing.first_met:
-                # 计算从第一次见面到现在的天数
-                delta = now - existing.first_met
-                days = delta.days + 1
 
-            # 更新画像
-            await self.create_or_update_profile(device_id, {
-                "last_interaction": now,
-                "total_interaction_days": days
-            })
-            return days
+        # 已有画像：当天已互动过则跳过写库（降低每轮对话写频）
+        if existing.first_met is not None and existing.last_interaction is not None:
+            if existing.last_interaction.date() == now.date():
+                return existing.total_interaction_days or 1
+
+        # 跨天或首次补录 first_met，更新互动天数
+        days = existing.total_interaction_days or 1
+        if existing.first_met:
+            # 计算从第一次见面到现在的天数
+            delta = now - existing.first_met
+            days = delta.days + 1
+
+        update_data = {
+            "last_interaction": now,
+            "total_interaction_days": days,
+        }
+        if existing.first_met is None:
+            # 画像已存在但缺 first_met（历史数据），补录
+            update_data["first_met"] = now
+        await self.create_or_update_profile(device_id, update_data)
+        return days
+
+    async def get_relationship_milestone(self, device_id: str) -> Optional[str]:
+        """
+        返回关系里程碑文案（如"今天是我们第一次见面"/"认识第 N 天"）
+
+        Args:
+            device_id: 设备ID
+
+        Returns:
+            里程碑文案；无 first_met 记录或无可展示里程碑时返回 None
+        """
+        profile = await self.get_user_profile(device_id)
+        if profile is None or profile.first_met is None:
+            return None
+
+        now = datetime.now()
+        days = (now - profile.first_met).days + 1
+        if days <= 1:
+            return "今天是我们第一次见面"
+        return f"今天是你和用户认识的第 {days} 天"
 
     async def get_interaction_days(self, device_id: str) -> int:
         """
@@ -673,6 +712,135 @@ class MemoryManager:
             delta = datetime.now() - profile.last_interaction
             return delta.days
         return None
+
+    async def generate_session_summary(
+        self,
+        messages: List[Dict[str, str]],
+        device_id: str,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None
+    ) -> Optional[BaseMemory]:
+        """生成陪伴卡（会话摘要）
+
+        LLM 模式：调用 LLM 提取情绪+话题+open_loops，存入 structured metadata
+        规则模式：取最后 N 条 user/assistant 消息拼接为极简摘要
+
+        Args:
+            messages: 格式化后的对话消息
+            device_id: 设备ID
+            user_id: 用户ID（可选）
+            session_id: 会话ID（可选，用于关联）
+
+        Returns:
+            SessionSummary 记忆对象，失败返回 None
+        """
+        try:
+            import logging
+            logger = logging.getLogger(__name__)
+            from memories.base import SessionSummary, MemoryType
+
+            # 收集对话文本
+            conversation_lines = []
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if not content:
+                    continue
+                role_name = "孩子" if role == "user" else "助手"
+                # 截断过长消息，节省 token
+                truncated = content[:200] + ("..." if len(content) > 200 else "")
+                conversation_lines.append(f"{role_name}: {truncated}")
+            conversation = "\n".join(conversation_lines)
+
+            if not conversation.strip():
+                return None
+
+            # 费用防护：超短会话（如仅寒暄"你好你好"）不调用 LLM，直接返回
+            # 既省 token，又避免无内容的陪伴卡在下轮被注入导致重复开场白
+            meaningful_turns = [m for m in messages if m.get("role") in ("user", "assistant")]
+            if len(meaningful_turns) < 3:
+                logger.info("[xiaozhi-memory] 会话轮数过少(<3)，跳过 LLM 陪伴卡生成")
+                return None
+            dedup_text = " ".join(m.get("content", "") for m in meaningful_turns).strip()
+            if len(dedup_text) < 30:
+                logger.info("[xiaozhi-memory] 会话有效文本过短(<30字)，跳过 LLM 陪伴卡生成")
+                return None
+
+            summary_text = ""
+            generation_mode = "rules"
+            metadata = {
+                "session_id": session_id or "",
+                "message_count": len(messages),
+                "generation_mode": "",
+            }
+
+            # LLM 模式：生成完整陪伴卡
+            if self.llm_client and self.session_summary_enabled:
+                try:
+                    context = {
+                        "current_date": datetime.now().strftime("%Y-%m-%d"),
+                    }
+                    summary_text = await self.llm_client.generate_summary(conversation, context)
+                    generation_mode = "llm"
+                    # 从 LLM 摘要中尝试提取结构化字段（最佳努力）
+                    metadata.update({
+                        "generation_mode": "llm",
+                        "emotion": "",    # LLM 摘要文本已包含情绪描述
+                        "open_loops": [],  # LLM 摘要文本已包含未完成事项
+                        "topic_summary": summary_text[:100],
+                    })
+                except Exception as e:
+                    logger.error(f"[xiaozhi-memory] LLM summary generation failed, falling back to rules: {e}")
+                    # LLM 失败时回退到规则模式
+                    summary_text = ""
+                    generation_mode = "rules"
+
+            # 规则模式：取最后 10 条消息拼接极简摘要
+            if not summary_text:
+                generation_mode = "rules"
+                # 过滤出 user 和 assistant 消息
+                meaningful = [m for m in messages if m.get("role") in ("user", "assistant")]
+                recent = meaningful[-10:] if len(meaningful) > 10 else meaningful
+
+                if recent:
+                    snippets = []
+                    for m in recent:
+                        content = m.get("content", "")
+                        if content:
+                            snippets.append(content[:80])  # 每条截断 80 字
+                    summary_text = "上次对话：\n" + "\n".join(snippets)
+                    metadata.update({
+                        "generation_mode": "rules",
+                        "emotion": "",
+                        "open_loops": [],
+                        "topic_summary": "",
+                    })
+
+            if not summary_text:
+                return None
+
+            # 创建 SessionSummary 记忆对象
+            summary = SessionSummary(
+                id=str(uuid.uuid4()),
+                device_id=device_id,
+                user_id=user_id,
+                content=summary_text,
+                metadata=metadata,
+                importance=0.6,  # 陪伴卡重要性略高于普通记忆
+            )
+
+            # 存入数据库
+            self.store.add(summary)
+            logger.info(
+                f"[xiaozhi-memory] Session summary saved: mode={generation_mode}, "
+                f"device={device_id}, content_len={len(summary_text)}"
+            )
+            return summary
+
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"[xiaozhi-memory] Failed to generate session summary: {e}")
+            return None
 
 
 # 便捷函数

@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
@@ -19,12 +20,17 @@ import xiaozhi.modules.agent.dao.AgentDao;
 import xiaozhi.modules.agent.entity.AgentChatHistoryEntity;
 import xiaozhi.modules.agent.entity.AgentEntity;
 import xiaozhi.modules.agent.entity.UserPersonaAssignmentEntity;
+import xiaozhi.modules.agent.entity.AgentTemplateEntity;
+import xiaozhi.modules.agent.service.AgentTemplateService;
 import xiaozhi.modules.agent.service.AgentChatHistoryService;
+import xiaozhi.modules.agent.service.DingTalkNotifier;
 import xiaozhi.modules.agent.service.PersonaMatcherService;
 import xiaozhi.modules.agent.service.UserPersonaAssignmentService;
 import xiaozhi.modules.agent.vo.PersonaCandidateVO;
 import xiaozhi.modules.device.dao.DeviceDao;
 import xiaozhi.modules.device.entity.DeviceEntity;
+import xiaozhi.modules.device.entity.DeviceExtEntity;
+import xiaozhi.modules.device.service.DeviceExtService;
 import xiaozhi.modules.llm.service.LLMService;
 
 @Slf4j
@@ -39,6 +45,9 @@ public class PersonaMatcherServiceImpl implements PersonaMatcherService {
     @Autowired private DeviceDao deviceDao;
     @Autowired private LLMService llmService;
     @Autowired private UserPersonaAssignmentService userPersonaAssignmentService;
+    @Autowired private AgentTemplateService agentTemplateService;
+    @Autowired private DeviceExtService deviceExtService;
+    @Autowired private DingTalkNotifier dingTalkNotifier;
 
     @Override
     public List<PersonaCandidateVO> listCandidatePersonas() {
@@ -156,6 +165,88 @@ public class PersonaMatcherServiceImpl implements PersonaMatcherService {
         log.info("[persona-match] user={} 切换到 agent={} score={} reason={}", userId, chosenAgentId, mr.score, mr.reason);
     }
 
+    @Async
+    @Override
+    public void matchColdStart(String deviceId) {
+        DeviceEntity device = deviceDao.selectById(deviceId);
+        if (device == null || device.getUserId() == null) {
+            return;
+        }
+        Long userId = device.getUserId();
+        UserPersonaAssignmentEntity cur = userPersonaAssignmentService.getByUserId(userId);
+        if (cur != null && cur.getManual() != null && cur.getManual() == 1) {
+            log.info("[persona-coldstart] user={} manual=1, skip", userId);
+            return;
+        }
+        DeviceExtEntity ext = deviceExtService.getByDeviceId(deviceId);
+        String childInfo = (ext != null && ext.getExtJson() != null) ? ext.getExtJson() : "{}";
+
+        List<AgentTemplateEntity> templates = agentTemplateService.list().stream()
+                .filter(t -> t.getMatchMetaJson() != null && !t.getMatchMetaJson().isBlank())
+                .collect(Collectors.toList());
+        if (templates.isEmpty()) {
+            log.warn("[persona-coldstart] 无可用乐宝模板 user={}", userId);
+            return;
+        }
+
+        MatchResult mr = matchTemplates(childInfo, templates);
+        if (mr == null || mr.choice < 1 || mr.choice > templates.size()) {
+            AgentTemplateEntity def = agentTemplateService.getDefaultTemplate();
+            String defId = (def != null && def.getId() != null) ? def.getId() : templates.get(0).getId();
+            seedTemplateToDevice(device, defId);
+            userPersonaAssignmentService.upsertColdStart(userId, defId, BigDecimal.ZERO,
+                    "未匹配到合适乐宝,已兜底默认", null, 1, "cold_start_default");
+            dingTalkNotifier.notify("【乐宝角色匹配兜底】用户 " + userId + " 设备 " + deviceId
+                    + " 未匹配到合适乐宝模板,已兜底默认角色,请关注是否需要扩充角色库。");
+            log.warn("[persona-coldstart] user={} 未匹配,兜底 template={}", userId, defId);
+            return;
+        }
+        AgentTemplateEntity chosen = templates.get(mr.choice - 1);
+        seedTemplateToDevice(device, chosen.getId());
+        userPersonaAssignmentService.upsertColdStart(userId, chosen.getId(), mr.score, mr.reason, null, 0, "cold_start");
+        log.info("[persona-coldstart] user={} 匹配 template={} score={} reason={}", userId, chosen.getId(), mr.score, mr.reason);
+    }
+
+    @Override
+    public String selectTemplateId(String childInfoJson) {
+        List<AgentTemplateEntity> templates = agentTemplateService.list().stream()
+                .filter(t -> t.getMatchMetaJson() != null && !t.getMatchMetaJson().isBlank())
+                .collect(Collectors.toList());
+        if (templates.isEmpty()) {
+            return null;
+        }
+        MatchResult mr = matchTemplates(childInfoJson, templates);
+        if (mr == null || mr.choice < 1 || mr.choice > templates.size()) {
+            return null;
+        }
+        return templates.get(mr.choice - 1).getId();
+    }
+
+    private MatchResult matchTemplates(String childInfoJson, List<AgentTemplateEntity> templates) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("【孩子信息(扩展字段)】\n").append(childInfoJson).append("\n\n【候选乐宝角色】\n");
+        int idx = 1;
+        for (AgentTemplateEntity t : templates) {
+            sb.append(idx++).append(". ").append(t.getAgentName()).append(": ").append(t.getMatchMetaJson()).append("\n");
+        }
+        String promptTemplate = buildTemplateInstruction();
+        String resp;
+        try {
+            resp = llmService.generateSummary(sb.toString(), promptTemplate, null);
+        } catch (Exception e) {
+            log.warn("[persona-coldstart] LLM 调用失败:{}", e.getMessage());
+            return null;
+        }
+        return parse(resp);
+    }
+
+    private String buildTemplateInstruction() {
+        return "你是儿童陪伴乐宝角色匹配器。根据【孩子信息(扩展字段)】从【候选乐宝角色】的编号列表里选最贴合的一个,"
+                + "每个候选给出结构化元数据(年龄段/性格标签/引导目标/情感支持强度/语言复杂度)。\n"
+                + "{conversation}\n\n"
+                + "只返回JSON,不要多余文字:{\"choice\":选中角色的编号(整数),\"score\":0.0到1.0,\"reason\":\"一句话\"}";
+    }
+
     private String buildConversation(String topics, List<AgentEntity> candidates, UserPersonaAssignmentEntity cur) {
         StringBuilder sb = new StringBuilder();
         sb.append("【孩子近期聊天】\n").append(topics).append("\n\n【候选陪伴角色】\n");
@@ -176,6 +267,44 @@ public class PersonaMatcherServiceImpl implements PersonaMatcherService {
                 + "若【当前角色】已足够合适,务必保留当前(孩子需要稳定陪伴)。仅当另一角色明显更贴合时才换。\n\n"
                 + "{conversation}\n\n"
                 + "只返回JSON,不要多余文字:{\"choice\":选中角色的编号(整数),\"score\":0.0到1.0,\"reason\":\"一句话\"}";
+    }
+
+    @Override
+    public void seedTemplateToDevice(DeviceEntity device, String templateId) {
+        if (device == null || templateId == null) {
+            return;
+        }
+        AgentTemplateEntity tpl = agentTemplateService.getById(templateId);
+        seedTemplateToAgent(device, tpl);
+    }
+
+    /** 将模板话术 seed 进设备绑定 agent 的 systemPrompt(供家长在角色配置里查看/编辑覆盖) */
+    private void seedTemplateToAgent(DeviceEntity device, AgentTemplateEntity template) {
+        if (device == null || template == null || device.getAgentId() == null) {
+            return;
+        }
+        AgentEntity agent = agentDao.selectById(device.getAgentId());
+        if (agent == null) {
+            return;
+        }
+        String base = template.getSystemPrompt();
+        agent.setSystemPrompt(base == null ? "" : base);
+        agentDao.updateById(agent);
+    }
+
+    /** 家长手动切换乐宝角色:seed 话术 + 标记 manual=1(自动任务不再覆盖) */
+    @Override
+    public void switchToTemplate(Long userId, String templateId) {
+        AgentTemplateEntity tpl = agentTemplateService.getById(templateId);
+        if (tpl == null) {
+            return;
+        }
+        List<DeviceEntity> devices = deviceDao.selectList(
+                new LambdaQueryWrapper<DeviceEntity>().eq(DeviceEntity::getUserId, userId));
+        for (DeviceEntity d : devices) {
+            seedTemplateToAgent(d, tpl);
+        }
+        userPersonaAssignmentService.upsertManual(userId, templateId, tpl.getAgentName());
     }
 
     private MatchResult parse(String resp) {

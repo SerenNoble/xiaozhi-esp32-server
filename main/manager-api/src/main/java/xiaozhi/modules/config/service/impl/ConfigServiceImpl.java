@@ -274,14 +274,22 @@ public class ConfigServiceImpl implements ConfigService {
     }
 
     /**
-     * 解析生效 prompt:优先乐宝模板(matched_template_id)+ 设备ext注入;
-     * 否则回退设备绑定 agent(现有 resolveEffectiveAgent)+ agent_ext 注入。
-     * 模板路径追加个性化设定块 {{ext.*}} 由设备ext填充;agent 路径沿用现有 agent_ext。
+     * 解析生效 prompt:乐宝模板命中时,优先使用设备绑定 agent 的 systemPrompt
+     * (匹配时已 seed 进模板话术,家长可在角色配置里手动编辑覆盖;个性化设定块与设备ext注入在运行时追加)。
+     * 仅当绑定 agent 未同步(老数据/seed 失败)时,才回退模板 prompt。
+     * 无匹配则回退设备绑定 agent(现有 resolveEffectiveAgent)+ agent_ext 注入。
      */
     private String resolveEffectivePrompt(DeviceEntity device, AgentEntity fallbackAgent) {
         if (device != null && device.getUserId() != null) {
             UserPersonaAssignmentEntity a = userPersonaAssignmentService.getByUserId(device.getUserId());
             if (a != null && a.getMatchedTemplateId() != null && !a.getMatchedTemplateId().isBlank()) {
+                // 已 seed 到绑定 agent 的 systemPrompt(支持家长编辑覆盖)
+                String base = fallbackAgent.getSystemPrompt();
+                if (base != null && !base.isBlank()) {
+                    String prompt = appendPersonalizationBlock(base);
+                    return applyDeviceExtToPrompt(prompt, device.getId());
+                }
+                // 安全兜底:绑定 agent 未同步时使用模板 prompt
                 AgentTemplateEntity tpl = agentTemplateService.getById(a.getMatchedTemplateId());
                 if (tpl != null && tpl.getSystemPrompt() != null && !tpl.getSystemPrompt().isBlank()) {
                     String prompt = appendPersonalizationBlock(tpl.getSystemPrompt());
